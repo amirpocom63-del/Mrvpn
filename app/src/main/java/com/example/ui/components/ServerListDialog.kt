@@ -9,6 +9,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -57,17 +59,18 @@ fun ServerListDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.6f))
+                .background(Color.Black.copy(alpha = 0.62f))
                 .clickable { onClose() },
             contentAlignment = Alignment.Center
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth(0.92f)
+                    .widthIn(max = 500.dp) // Responsive size limit for tablets and larger screens
                     .fillMaxHeight(0.85f)
                     .background(Color(0xFF0F1426), shape = RoundedCornerShape(28.dp))
-                    .border(1.5.dp, CyberCyan.copy(alpha = 0.3f), RoundedCornerShape(28.dp))
-                    .clickable(enabled = false) {}
+                    .border(1.5.dp, CyberCyan.copy(alpha = 0.35f), RoundedCornerShape(28.dp))
+                    .clickable(enabled = true, onClick = { /* consume click events to prevent parent close triggers */ })
                     .padding(20.dp)
                     .testTag("server_list_dialog_box")
             ) {
@@ -93,7 +96,9 @@ fun ServerListDialog(
 
                     Column(
                         horizontalAlignment = Alignment.End,
-                        modifier = Modifier.weight(1f).padding(end = 6.dp)
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 6.dp)
                     ) {
                         Text(
                             text = "لیست سرورهای هوشمند",
@@ -124,7 +129,7 @@ fun ServerListDialog(
                     ),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(44.dp)
+                        .height(46.dp)
                         .testTag("dialog_test_all_pings_button"),
                     shape = RoundedCornerShape(12.dp)
                 ) {
@@ -156,29 +161,31 @@ fun ServerListDialog(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Scrollable Servers list
-                Column(
+                // Scrollable Servers list - refactored to LazyColumn for ultimate performance & responsiveness
+                LazyColumn(
                     modifier = Modifier
                         .weight(1f)
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState())
+                        .fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     if (servers.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 40.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "هیچ سروری یافت نشد. منتظر بروزرسانی بمانید.",
-                                color = Color.White.copy(alpha = 0.4f),
-                                fontSize = 12.sp,
-                                textAlign = TextAlign.Center
-                            )
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 40.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "هیچ سروری یافت نشد. منتظر بروزرسانی بمانید.",
+                                    color = Color.White.copy(alpha = 0.4f),
+                                    fontSize = 12.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
                         }
                     } else {
-                        servers.forEachIndexed { index, server ->
+                        items(servers) { server ->
                             val isSelected = selectedServer?.id == server.id
                             val protocol = getProtocolTag(server)
                             val (protocolColor, protocolBg) = getProtocolColors(protocol)
@@ -186,7 +193,6 @@ fun ServerListDialog(
                             Card(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 6.dp)
                                     .clip(RoundedCornerShape(16.dp))
                                     .clickable {
                                         onServerSelected(server)
@@ -197,7 +203,7 @@ fun ServerListDialog(
                                 ),
                                 border = androidx.compose.foundation.BorderStroke(
                                     width = 1.dp,
-                                    color = if (isSelected) CyberCyan.copy(alpha = 0.5f) else Color.White.copy(alpha = 0.05f)
+                                    color = if (isSelected) CyberCyan.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.05f)
                                 )
                             ) {
                                 Row(
@@ -207,31 +213,36 @@ fun ServerListDialog(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    // Left: Test ping icon button + Latency score
+                                    // Left: Test ping area (interactive, easy to tap)
                                     val pingVal = serverPings[server.id]
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        modifier = Modifier.width(90.dp)
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        modifier = Modifier
+                                            .width(95.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(Color.White.copy(alpha = 0.02f))
+                                            .clickable { onTestSinglePing(server) } // whole area clickable for quick ping test
+                                            .padding(4.dp)
                                     ) {
                                         IconButton(
                                             onClick = { onTestSinglePing(server) },
                                             modifier = Modifier
-                                                .size(30.dp)
+                                                .size(36.dp)
                                                 .background(Color.White.copy(alpha = 0.04f), CircleShape)
                                         ) {
                                             Icon(
                                                 imageVector = Icons.Default.Refresh,
                                                 contentDescription = "تست پینگ",
-                                                tint = CyberCyan.copy(alpha = 0.7f),
-                                                modifier = Modifier.size(14.dp)
+                                                tint = CyberCyan.copy(alpha = 0.9f),
+                                                modifier = Modifier.size(16.dp)
                                             )
                                         }
 
                                         if (pingVal == null) {
                                             Text(
                                                 text = "کلیک",
-                                                color = Color.White.copy(alpha = 0.3f),
+                                                color = Color.White.copy(alpha = 0.35f),
                                                 fontSize = 11.sp,
                                                 fontWeight = FontWeight.Medium
                                             )

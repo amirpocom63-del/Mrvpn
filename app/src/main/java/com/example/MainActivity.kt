@@ -8,6 +8,8 @@ import androidx.activity.viewModels
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
@@ -56,6 +58,8 @@ class MainActivity : ComponentActivity() {
         setContent {
             var isDarkTheme by remember { mutableStateOf(true) }
             var showServerListDialog by remember { mutableStateOf(false) }
+            var currentTab by remember { mutableStateOf(AppTab.HOME) }
+
             MyApplicationTheme(darkTheme = isDarkTheme) {
                 val servers by viewModel.servers.collectAsStateWithLifecycle()
                 val selectedServer by viewModel.selectedServer.collectAsStateWithLifecycle()
@@ -71,76 +75,91 @@ class MainActivity : ComponentActivity() {
                 Scaffold(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.background)
+                        .background(MaterialTheme.colorScheme.background),
+                    bottomBar = {
+                        TabNavigationBar(
+                            currentTab = currentTab,
+                            onTabSelected = { currentTab = it }
+                        )
+                    }
                 ) { innerPadding ->
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .background(MaterialTheme.colorScheme.background)
+                            .padding(innerPadding)
                     ) {
-                        // Main Dashboard Client Surface
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .statusBarsPadding()
-                                .navigationBarsPadding(),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            AppHeader(
-                                isDarkTheme = isDarkTheme,
-                                onThemeToggle = { isDarkTheme = !isDarkTheme }
+                        if (currentTab == AppTab.HOME) {
+                            // Main Dashboard Client Surface
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .statusBarsPadding()
+                                    .verticalScroll(rememberScrollState()),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                AppHeader(
+                                    isDarkTheme = isDarkTheme,
+                                    onThemeToggle = { isDarkTheme = !isDarkTheme }
+                                )
+
+                                Spacer(modifier = Modifier.height(16.dp))
+
+                                // Large Glowing VPN Connection Hub
+                                PowerButton(
+                                    connectionState = connectionState,
+                                    onClick = { handleVpnToggle() }
+                                )
+
+                                Spacer(modifier = Modifier.height(24.dp))
+
+                                // Status textual display
+                                val activeServerName = selectedServer?.name ?: "سروری انتخاب نشده است"
+                                MainStatusDisplay(
+                                    connectionState = connectionState,
+                                    serverName = activeServerName
+                                )
+
+                                Spacer(modifier = Modifier.height(18.dp))
+
+                                // Speed indicator panel
+                                RealtimeSpeedDashboard(networkSpeed = networkSpeed)
+
+                                Spacer(modifier = Modifier.height(14.dp))
+
+                                // Encryption metadata + Latency Checker
+                                SmartConfigPingWidget(
+                                    connectionState = connectionState,
+                                    pingMs = pingMs,
+                                    isPinging = isPinging,
+                                    onTestPingClick = { viewModel.triggerPing() }
+                                )
+
+                                Spacer(modifier = Modifier.height(14.dp))
+
+                                // Server selections and administration entry
+                                ServerSelectorCard(
+                                    selectedServer = selectedServer,
+                                    servers = servers,
+                                    serverPings = serverPings,
+                                    isPingingAll = isPingingAll,
+                                    onTestAllPings = { viewModel.testAllServerPings() },
+                                    onSmartConnect = { viewModel.connectToBestServer() },
+                                    onServerSelected = { viewModel.selectServer(it) },
+                                    isSyncing = isSyncingSubscription,
+                                    syncError = subscriptionSyncError,
+                                    onSyncClick = { viewModel.triggerSubscriptionSync(manually = true) },
+                                    onOpenServerList = { showServerListDialog = true }
+                                )
+
+                                Spacer(modifier = Modifier.height(32.dp))
+                            }
+                        } else {
+                            AboutUsScreen(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .statusBarsPadding()
                             )
-
-                            Spacer(modifier = Modifier.weight(0.2f))
-
-                            // Large Glowing VPN Connection Hub
-                            PowerButton(
-                                connectionState = connectionState,
-                                onClick = { handleVpnToggle() }
-                            )
-
-                            Spacer(modifier = Modifier.height(24.dp))
-
-                            // Status textual display
-                            val activeServerName = selectedServer?.name ?: "سروری انتخاب نشده است"
-                            MainStatusDisplay(
-                                connectionState = connectionState,
-                                serverName = activeServerName
-                            )
-
-                            Spacer(modifier = Modifier.height(18.dp))
-
-                            // Speed indicator panel
-                            RealtimeSpeedDashboard(networkSpeed = networkSpeed)
-
-                            Spacer(modifier = Modifier.height(14.dp))
-
-                            // Encryption metadata + Latency Checker
-                            SmartConfigPingWidget(
-                                connectionState = connectionState,
-                                pingMs = pingMs,
-                                isPinging = isPinging,
-                                onTestPingClick = { viewModel.triggerPing() }
-                            )
-
-                            Spacer(modifier = Modifier.height(14.dp))
-
-                            // Server selections and administration entry
-                            ServerSelectorCard(
-                                selectedServer = selectedServer,
-                                servers = servers,
-                                serverPings = serverPings,
-                                isPingingAll = isPingingAll,
-                                onTestAllPings = { viewModel.testAllServerPings() },
-                                onSmartConnect = { viewModel.connectToBestServer() },
-                                onServerSelected = { viewModel.selectServer(it) },
-                                isSyncing = isSyncingSubscription,
-                                syncError = subscriptionSyncError,
-                                onSyncClick = { viewModel.triggerSubscriptionSync(manually = true) },
-                                onOpenServerList = { showServerListDialog = true }
-                            )
-
-                            Spacer(modifier = Modifier.weight(1.0f))
                         }
 
                         // Detailed, comprehensive server selector dialog
@@ -152,6 +171,9 @@ class MainActivity : ComponentActivity() {
                             isPingingAll = isPingingAll,
                             onServerSelected = { server ->
                                 viewModel.selectServer(server)
+                                if (connectionState == com.example.viewmodel.VpnConnectionState.DISCONNECTED) {
+                                    handleVpnToggle()
+                                }
                                 showServerListDialog = false
                             },
                             onTestSinglePing = { server ->
