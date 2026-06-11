@@ -12,5 +12,6 @@ data class VpnServer(
     val remarks: String = "",
     val isDefault: Boolean = false,
     val encryptedConfig: String = "",
-    val encryptionKey: String = ""
+    val encryptionKey: String = "",
+    val isUserConfig: Boolean = false
 )

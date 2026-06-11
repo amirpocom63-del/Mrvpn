@@ -43,6 +43,7 @@ class MyVpnService : VpnService(), Runnable {
     private val proxyPort = 20808
     private var activeConfigUrl: String? = null
     private var tunnelReaderThread: Thread? = null
+    private val ipToDomainMap = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     private val CHANNEL_ID = "MyVpnServiceChannel"
     private val NOTIFICATION_ID = 4591
@@ -268,136 +269,163 @@ class MyVpnService : VpnService(), Runnable {
         if (qdCount <= 0) return
         
         try {
-            val (domainName, endQnamePos) = parseDnsName(packet, dnsOffset + 12)
+            val (domainName, _) = parseDnsName(packet, dnsOffset + 12)
             if (domainName.isEmpty()) return
             
-            // Resolve domain name in a background task via protected socket
+            // Capture DNS payload safely synchronously (prevents concurrent overwrite in recycled buffer)
+            val dnsPayloadOffset = ipHeaderLen + 8
+            val dnsPayloadLen = len - dnsPayloadOffset
+            if (dnsPayloadLen <= 0) return
+            val dnsPayload = packet.copyOfRange(dnsPayloadOffset, len)
+            
+            val srcIp = ByteArray(4)
+            val destIp = ByteArray(4)
+            System.arraycopy(packet, 12, srcIp, 0, 4)
+            System.arraycopy(packet, 16, destIp, 0, 4)
+            
             Thread {
+                var dnsSocket: java.net.DatagramSocket? = null
                 try {
-                    val ips = resolveDnsProtected(domainName)
-                    if (ips.isEmpty()) return@Thread
+                    dnsSocket = java.net.DatagramSocket()
+                    protect(dnsSocket)
+                    dnsSocket.soTimeout = 2000
                     
-                    // Build DNS response
-                    val dnsResp = ByteArrayOutputStream()
-                    // Tx ID
-                    dnsResp.write(txId0.toInt())
-                    dnsResp.write(txId1.toInt())
-                    // Flags: Response, Opcode 0, Authoritative 0, Truncated 0, Recursion Desired 1, Recursion Available 1, Rcode 0
-                    dnsResp.write(0x81)
-                    dnsResp.write(0x80)
-                    // QDCount (1)
-                    dnsResp.write(0x00)
-                    dnsResp.write(0x01)
+                    val dnsServers = listOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222")
+                    var dnsRespBytes: ByteArray? = null
                     
-                    // Parse original QTYPE and QCLASS
-                    val originalQType = if (endQnamePos + 1 < packet.size) {
-                        ((packet[endQnamePos].toInt() and 0xFF) shl 8) or (packet[endQnamePos + 1].toInt() and 0xFF)
-                    } else {
-                        1
-                    }
-                    
-                    // Only return IP answers if the query is an 'A' record (IPv4)
-                    val anCount = if (originalQType == 1) ips.size.coerceAtMost(10) else 0
-                    
-                    // ANCount
-                    dnsResp.write(0x00)
-                    dnsResp.write(anCount)
-                    // NSCount
-                    dnsResp.write(0x00)
-                    dnsResp.write(0x00)
-                    // ARCount
-                    dnsResp.write(0x00)
-                    dnsResp.write(0x00)
-                    
-                    // Re-write query question section (QNAME)
-                    val qNameLen = endQnamePos - (dnsOffset + 12)
-                    dnsResp.write(packet, dnsOffset + 12, qNameLen)
-                    
-                    // Re-write raw QTYPE and QCLASS exactly as in the query
-                    if (endQnamePos + 3 < packet.size) {
-                        dnsResp.write(packet, endQnamePos, 4)
-                    } else {
-                        dnsResp.write(0x00)
-                        dnsResp.write(0x01)
-                        dnsResp.write(0x00)
-                        dnsResp.write(0x01)
-                    }
-                    
-                    // Answers (only for standard A queries)
-                    if (originalQType == 1) {
-                        for (i in 0 until anCount) {
-                            // Name pointer to question at offset 12
-                            dnsResp.write(0xC0)
-                            dnsResp.write(0x0C)
-                            // TYPE (A = 1)
-                            dnsResp.write(0x00)
-                            dnsResp.write(0x01)
-                            // CLASS (IN = 1)
-                            dnsResp.write(0x00)
-                            dnsResp.write(0x01)
-                            // TTL (e.g. 60 seconds)
-                            dnsResp.write(0x00)
-                            dnsResp.write(0x00)
-                            dnsResp.write(0x00)
-                            dnsResp.write(0x3C)
-                            // RDLENGTH (4 bytes for IPv4)
-                            dnsResp.write(0x00)
-                            dnsResp.write(0x04)
-                            // IP address bytes
-                            dnsResp.write(ips[i].address)
+                    // 1. Try DNS over secure VLESS Tunnel first (100% encrypted, avoids any local censorship/detection)
+                    if (activeConfigUrl != null) {
+                        for (serverIp in dnsServers) {
+                            try {
+                                val resp = resolveDnsOverTunnel(dnsPayload, serverIp)
+                                if (resp != null && resp.size > 12) {
+                                    dnsRespBytes = resp
+                                    Log.d("MyVpnService", "Resolved DNS securely via VLESS Tunnel over $serverIp for $domainName")
+                                    break
+                                }
+                            } catch (ex: Exception) {
+                                // Try next
+                            }
                         }
                     }
                     
-                    val dnsBytes = dnsResp.toByteArray()
+                    // 2. Fallback to DNS over HTTPS (DoH) over direct interface (extremely robust, uses port 443 which is always open)
+                    if (dnsRespBytes == null) {
+                        for (serverIp in dnsServers) {
+                            try {
+                                val resp = resolveDnsOverHttps(dnsPayload, serverIp)
+                                if (resp != null && resp.size > 12) {
+                                    dnsRespBytes = resp
+                                    Log.d("MyVpnService", "Resolved DNS via DoH over $serverIp for $domainName")
+                                    break
+                                }
+                            } catch (ex: Exception) {
+                                // Try next
+                            }
+                        }
+                    }
                     
-                    // Build UDP response
-                    val udpLen = 8 + dnsBytes.size
+                    // 3. Fallback to standard DNS over TCP
+                    if (dnsRespBytes == null) {
+                        for (serverIp in dnsServers) {
+                            try {
+                                val resp = resolveDnsOverTcp(dnsPayload, serverIp)
+                                if (resp != null && resp.size > 12) {
+                                    dnsRespBytes = resp
+                                    Log.d("MyVpnService", "Resolved DNS via TCP over $serverIp for $domainName")
+                                    break
+                                }
+                            } catch (ex: Exception) {
+                                // Try next
+                            }
+                        }
+                    }
+                    
+                    // 4. Fallback to standard UDP DNS
+                    if (dnsRespBytes == null) {
+                        for (serverIp in dnsServers) {
+                            try {
+                                val serverAddress = java.net.InetAddress.getByName(serverIp)
+                                val sendPacket = java.net.DatagramPacket(dnsPayload, dnsPayload.size, serverAddress, 53)
+                                dnsSocket.send(sendPacket)
+                                
+                                val recvBuf = ByteArray(2048)
+                                val recvPacket = java.net.DatagramPacket(recvBuf, recvBuf.size)
+                                dnsSocket.receive(recvPacket)
+                                
+                                val resp = recvPacket.data.copyOfRange(0, recvPacket.length)
+                                if (resp.size > 12) {
+                                    dnsRespBytes = resp
+                                    Log.d("MyVpnService", "Resolved DNS via UDP over $serverIp for $domainName")
+                                    break
+                                }
+                            } catch (ex: Exception) {
+                                // Try next
+                            }
+                        }
+                    }
+                    
+                    if (dnsRespBytes == null) {
+                        Log.w("MyVpnService", "All TCP/UDP DNS servers failed for $domainName, falling back to local resolver...")
+                        val resolvedIps = try {
+                            java.net.InetAddress.getAllByName(domainName).toList()
+                        } catch (e: Exception) {
+                            emptyList()
+                        }
+                        
+                        if (resolvedIps.isNotEmpty()) {
+                            for (ip in resolvedIps) {
+                                val ipStr = ip.hostAddress
+                                ipToDomainMap[ipStr] = domainName
+                                Log.d("MyVpnService", "Parsed map via local resolver fallback: $ipStr -> $domainName")
+                            }
+                            dnsRespBytes = constructLocalDnsResponse(txId0, txId1, domainName, resolvedIps)
+                        } else {
+                            Log.e("MyVpnService", "All DNS servers and local resolver failed for $domainName")
+                            return@Thread
+                        }
+                    } else {
+                        // Parse response to associate IP -> domain safely
+                        parseDnsResponseAndPopulateMap(dnsRespBytes, domainName)
+                    }
+                    
+                    // Wrap response in IPv4/UDP packet
+                    val udpLen = 8 + dnsRespBytes.size
                     val ipLen = 20 + udpLen
-                    
                     val respPacket = ByteArray(ipLen)
+                    
                     // IPv4 Header
-                    respPacket[0] = 0x45.toByte()
-                    respPacket[1] = 0x00.toByte()
+                    respPacket[0] = 0x45.toByte()     // Version 4, Header Len 5 (20 bytes)
+                    respPacket[1] = 0x00.toByte()     // TOS
                     respPacket[2] = ((ipLen shr 8) and 0xFF).toByte()
                     respPacket[3] = (ipLen and 0xFF).toByte()
-                    // ID
-                    respPacket[4] = 0x00.toByte()
+                    respPacket[4] = 0x00.toByte()     // Identification
                     respPacket[5] = 0x00.toByte()
-                    // Flags & Frag offset
-                    respPacket[6] = 0x40.toByte() // Don't fragment
+                    respPacket[6] = 0x40.toByte()     // Flags: Don't Fragment
                     respPacket[7] = 0x00.toByte()
-                    // TTL
-                    respPacket[8] = 0x40.toByte()
-                    // Protocol (17)
-                    respPacket[9] = 17.toByte()
-                    // Checksum (keep 0, the kernel will calculate or re-calculate it)
-                    respPacket[10] = 0x00.toByte()
+                    respPacket[8] = 0x40.toByte()     // TTL: 64
+                    respPacket[9] = 17.toByte()       // Protocol: UDP (17)
+                    respPacket[10] = 0x00.toByte()    // Header Checksum
                     respPacket[11] = 0x00.toByte()
                     
-                    // Swap IP addresses
-                    // Src IP was dest IP of query
-                    System.arraycopy(packet, 16, respPacket, 12, 4)
-                    // Dest IP was src IP of query
-                    System.arraycopy(packet, 12, respPacket, 16, 4)
+                    // Swap IP addresses (Src IP is now the query's dest IP; Dest IP is the query's src IP)
+                    System.arraycopy(destIp, 0, respPacket, 12, 4)
+                    System.arraycopy(srcIp, 0, respPacket, 16, 4)
                     
                     // UDP Header
-                    // Src Port (53)
                     respPacket[20] = 0x00.toByte()
-                    respPacket[21] = 0x35.toByte()
-                    // Dest Port (query's srcPort)
+                    respPacket[21] = 0x35.toByte()    // Source Port: 53
                     respPacket[22] = ((srcPort shr 8) and 0xFF).toByte()
                     respPacket[23] = (srcPort and 0xFF).toByte()
-                    // UDP Length
                     respPacket[24] = ((udpLen shr 8) and 0xFF).toByte()
                     respPacket[25] = (udpLen and 0xFF).toByte()
-                    // UDP Checksum (0 means disabled)
-                    respPacket[26] = 0x00.toByte()
+                    respPacket[26] = 0x00.toByte()    // Checksum disabled
                     respPacket[27] = 0x00.toByte()
                     
-                    // Copy DNS payload
-                    System.arraycopy(dnsBytes, 0, respPacket, 28, dnsBytes.size)
+                    // Copy dns response payload
+                    System.arraycopy(dnsRespBytes, 0, respPacket, 28, dnsRespBytes.size)
                     
-                    // Recalculate IPv4 Checksum
+                    // Recalculate IPv4 Header Checksum
                     val checksum = calculateChecksum(respPacket, 20)
                     respPacket[10] = ((checksum shr 8) and 0xFF).toByte()
                     respPacket[11] = (checksum and 0xFF).toByte()
@@ -407,41 +435,262 @@ class MyVpnService : VpnService(), Runnable {
                         out.flush()
                     }
                 } catch (e: Exception) {
-                    Log.e("MyVpnService", "Error resolving DNS for $domainName", e)
+                    Log.e("MyVpnService", "Error forwarding DNS to upstream for $domainName", e)
+                } finally {
+                    try { dnsSocket?.close() } catch (ex: Exception) {}
                 }
             }.start()
-            
         } catch (e: Exception) {
             Log.e("MyVpnService", "Error parsing DNS packet", e)
         }
     }
 
-    private fun calculateChecksum(buf: ByteArray, length: Int): Int {
-        var sum = 0
-        var i = 0
-        while (i < length) {
-            val word = ((buf[i].toInt() and 0xFF) shl 8) or (buf[i + 1].toInt() and 0xFF)
-            sum += word
-            i += 2
+    private fun parseDnsResponseAndPopulateMap(responseBytes: ByteArray, domainName: String) {
+        if (responseBytes.size < 12) return
+        val qdCount = ((responseBytes[4].toInt() and 0xFF) shl 8) or (responseBytes[5].toInt() and 0xFF)
+        val anCount = ((responseBytes[6].toInt() and 0xFF) shl 8) or (responseBytes[7].toInt() and 0xFF)
+        
+        var pos = 12
+        // Skip Questions section
+        for (i in 0 until qdCount) {
+            pos = skipDnsName(responseBytes, pos)
+            pos += 4 // Type (2 bytes) + Class (2 bytes)
         }
-        while (sum shr 16 != 0) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
+        
+        // Parse Answers section
+        for (i in 0 until anCount) {
+            if (pos >= responseBytes.size) break
+            pos = skipDnsName(responseBytes, pos)
+            if (pos + 10 > responseBytes.size) break
+            
+            val type = ((responseBytes[pos].toInt() and 0xFF) shl 8) or (responseBytes[pos + 1].toInt() and 0xFF)
+            val rdLength = ((responseBytes[pos + 8].toInt() and 0xFF) shl 8) or (responseBytes[pos + 9].toInt() and 0xFF)
+            pos += 10
+            
+            if (pos + rdLength > responseBytes.size) break
+            
+            if (type == 1 && rdLength == 4) { // IPv4 A record
+                val ipBytes = responseBytes.copyOfRange(pos, pos + 4)
+                val ipAddress = java.net.InetAddress.getByAddress(ipBytes).hostAddress
+                ipToDomainMap[ipAddress] = domainName
+                Log.d("MyVpnService", "Parsed map: $ipAddress -> $domainName")
+            } else if (type == 28 && rdLength == 16) { // IPv6 AAAA record
+                val ipBytes = responseBytes.copyOfRange(pos, pos + 16)
+                val ipAddress = java.net.InetAddress.getByAddress(ipBytes).hostAddress
+                ipToDomainMap[ipAddress] = domainName
+                Log.d("MyVpnService", "Parsed map: $ipAddress -> $domainName")
+            }
+            pos += rdLength
         }
-        return (sum.inv()) and 0xFFFF
     }
 
-    private fun resolveDnsProtected(domain: String): List<InetAddress> {
-        return try {
-            InetAddress.getAllByName(domain).filter { it is java.net.Inet4Address }
+    private fun resolveDnsOverTcp(dnsPayload: ByteArray, serverIp: String): ByteArray? {
+        var socket: java.net.Socket? = null
+        try {
+            socket = java.net.Socket()
+            protect(socket)
+            socket.connect(java.net.InetSocketAddress(serverIp, 53), 2000)
+            socket.soTimeout = 2500
+            
+            val output = socket.getOutputStream()
+            val input = socket.getInputStream()
+            
+            val len = dnsPayload.size
+            output.write((len shr 8) and 0xFF)
+            output.write(len and 0xFF)
+            output.write(dnsPayload)
+            output.flush()
+            
+            val len0 = input.read()
+            val len1 = input.read()
+            if (len0 < 0 || len1 < 0) return null
+            val respLen = (len0 shl 8) or len1
+            if (respLen <= 0 || respLen > 4096) return null
+            
+            val respBuf = ByteArray(respLen)
+            var bytesRead = 0
+            while (bytesRead < respLen) {
+                val r = input.read(respBuf, bytesRead, respLen - bytesRead)
+                if (r < 0) return null
+                bytesRead += r
+            }
+            return respBuf
         } catch (e: Exception) {
-            Log.e("MyVpnService", "Failed to resolve DNS over system resolver for $domain: ${e.message}")
-            emptyList()
+            return null
+        } finally {
+            try { socket?.close() } catch (ex: Exception) {}
         }
+    }
+
+    private fun resolveDnsOverTunnel(dnsPayload: ByteArray, serverIp: String): ByteArray? {
+        var tunnel: RemoteTunnel? = null
+        try {
+            tunnel = connectToRemote(serverIp, 53) ?: return null
+            
+            val len = dnsPayload.size
+            val queryWithLen = ByteArray(2 + len)
+            queryWithLen[0] = ((len shr 8) and 0xFF).toByte()
+            queryWithLen[1] = (len and 0xFF).toByte()
+            System.arraycopy(dnsPayload, 0, queryWithLen, 2, len)
+            
+            tunnel.send(queryWithLen, queryWithLen.size)
+            
+            val firstChunk = tunnel.receive() ?: return null
+            if (firstChunk.size < 2) return null
+            
+            val respLen = ((firstChunk[0].toInt() and 0xFF) shl 8) or (firstChunk[1].toInt() and 0xFF)
+            if (respLen <= 0 || respLen > 4096) return null
+            
+            val bos = java.io.ByteArrayOutputStream()
+            bos.write(firstChunk, 2, firstChunk.size - 2)
+            
+            var timeoutCount = 0
+            while (bos.size() < respLen && timeoutCount < 10) {
+                val chunk = tunnel.receive()
+                if (chunk != null && chunk.isNotEmpty()) {
+                    bos.write(chunk)
+                } else {
+                    Thread.sleep(50)
+                    timeoutCount++
+                }
+            }
+            
+            val bytes = bos.toByteArray()
+            return if (bytes.size >= respLen) {
+                bytes.copyOfRange(0, respLen)
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            Log.e("MyVpnService", "Error in resolveDnsOverTunnel to $serverIp", e)
+            return null
+        } finally {
+            try { tunnel?.close() } catch (ex: Exception) {}
+        }
+    }
+
+    private fun resolveDnsOverHttps(dnsPayload: ByteArray, dnsServerIp: String): ByteArray? {
+        var conn: java.net.HttpURLConnection? = null
+        try {
+            val url = java.net.URL("https://$dnsServerIp/dns-query")
+            conn = url.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 3000
+            conn.readTimeout = 3000
+            conn.doOutput = true
+            conn.doInput = true
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/dns-message")
+            conn.setRequestProperty("Accept", "application/dns-message")
+            
+            val out = conn.outputStream
+            out.write(dnsPayload)
+            out.flush()
+            out.close()
+            
+            val code = conn.responseCode
+            if (code == 200) {
+                val input = conn.inputStream
+                val outBytes = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(2048)
+                while (true) {
+                    val r = input.read(buf)
+                    if (r < 0) break
+                    outBytes.write(buf, 0, r)
+                }
+                return outBytes.toByteArray()
+            } else {
+                Log.w("MyVpnService", "DoH failed with code $code on server $dnsServerIp")
+            }
+        } catch (e: Exception) {
+            Log.e("MyVpnService", "DoH exception on server $dnsServerIp: ${e.message}")
+        } finally {
+            conn?.disconnect()
+        }
+        return null
+    }
+
+    private fun constructLocalDnsResponse(txId0: Byte, txId1: Byte, domainName: String, ips: List<java.net.InetAddress>): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        // Transaction ID
+        out.write(txId0.toInt())
+        out.write(txId1.toInt())
+        // Flags: 0x8180 (Standard response, no error)
+        out.write(0x81)
+        out.write(0x80)
+        // Questions count: 1
+        out.write(0x00)
+        out.write(0x01)
+        // Answers count: ips.size
+        out.write(0x00)
+        out.write(ips.size and 0xFF)
+        // Authority RRs: 0
+        out.write(0x00)
+        out.write(0x00)
+        // Additional RRs: 0
+        out.write(0x00)
+        out.write(0x00)
+        
+        // Question section
+        val labels = domainName.split(".")
+        for (label in labels) {
+            val labelBytes = label.toByteArray(Charsets.US_ASCII)
+            out.write(labelBytes.size)
+            out.write(labelBytes)
+        }
+        out.write(0) // Null byte terminates label sequence
+        
+        // Type A (1), Class IN (1)
+        out.write(0x00)
+        out.write(0x01)
+        out.write(0x00)
+        out.write(0x01)
+        
+        // Answers section
+        for (ip in ips) {
+            val addr = ip.address
+            if (addr.size == 4) { // IPv4 A record
+                out.write(0xC0)
+                out.write(0x0C)
+                // Type A (1), Class IN (1)
+                out.write(0x00)
+                out.write(0x01)
+                out.write(0x00)
+                out.write(0x01)
+                // TTL (120 sec)
+                out.write(0x00)
+                out.write(0x00)
+                out.write(0x00)
+                out.write(0x78)
+                // Data length: 4
+                out.write(0x00)
+                out.write(0x04)
+                // IP bytes
+                out.write(addr)
+            }
+        }
+        return out.toByteArray()
+    }
+
+    private fun skipDnsName(bytes: ByteArray, startPos: Int): Int {
+        var pos = startPos
+        while (pos < bytes.size) {
+            val len = bytes[pos].toInt() and 0xFF
+            if (len == 0) {
+                pos++
+                break
+            }
+            if ((len and 0xC0) == 0xC0) { // Compression pointer
+                pos += 2
+                break
+            }
+            pos += 1 + len
+        }
+        return pos
     }
 
     private fun parseDnsName(packet: ByteArray, startOffset: Int): Pair<String, Int> {
         var pos = startOffset
-        val sb = StringBuilder()
+        val sb = java.lang.StringBuilder()
         while (pos < packet.size) {
             val len = packet[pos].toInt() and 0xFF
             if (len == 0) {
@@ -457,6 +706,20 @@ class MyVpnService : VpnService(), Runnable {
             pos += 1 + len
         }
         return Pair(sb.toString(), pos)
+    }
+
+    private fun calculateChecksum(buf: ByteArray, length: Int): Int {
+        var sum = 0
+        var i = 0
+        while (i < length) {
+            val word = ((buf[i].toInt() and 0xFF) shl 8) or (buf[i + 1].toInt() and 0xFF)
+            sum += word
+            i += 2
+        }
+        while (sum shr 16 != 0) {
+            sum = (sum and 0xFFFF) + (sum shr 16)
+        }
+        return (sum.inv()) and 0xFFFF
     }
 
     private val activeTcpSessions = java.util.concurrent.ConcurrentHashMap<String, TransparentTcpSession>()
@@ -483,7 +746,8 @@ class MyVpnService : VpnService(), Runnable {
         // Skip loopback connection attempts
         if (srcPort == proxyPort || destPort == proxyPort) return
         
-        val destHost = java.net.InetAddress.getByAddress(destIp).hostAddress
+        val rawIp = java.net.InetAddress.getByAddress(destIp).hostAddress
+        val destHost = ipToDomainMap[rawIp] ?: rawIp
         val sessionKey = "$srcPort->$destHost:$destPort"
         
         val seqBytes = ByteArray(4)
@@ -502,6 +766,21 @@ class MyVpnService : VpnService(), Runnable {
         val tcpHeaderLen = ((packet[ipHeaderLen + 12].toInt() shr 4) and 0x0F) * 4
         val payloadOffset = ipHeaderLen + tcpHeaderLen
         val payloadLen = len - payloadOffset
+        
+        if (destPort == 853) {
+            sendTcpPacket(
+                srcIp = destIp,
+                dstIp = srcIp,
+                srcPort = destPort,
+                dstPort = srcPort,
+                seq = 0,
+                ack = seq + (if (isSyn) 1 else 0) + payloadLen,
+                flags = 0x04, // RST
+                payload = null,
+                outputStream = out
+            )
+            return
+        }
         
         if (isRst) {
             val session = activeTcpSessions.remove(sessionKey)
@@ -650,28 +929,27 @@ class MyVpnService : VpnService(), Runnable {
                 val payloadBytes = ByteArray(payloadLen)
                 System.arraycopy(packet, payloadOffset, payloadBytes, 0, payloadLen)
                 
-                Thread {
-                    try {
-                        val tunnel = session.remoteTunnel
-                        if (tunnel != null) {
-                            tunnel.send(payloadBytes, payloadLen)
-                            
-                            session.clientSeq = seq + payloadLen
-                            sendTcpPacket(
-                                srcIp = session.destIp,
-                                dstIp = session.clientIp,
-                                srcPort = session.destPort,
-                                dstPort = session.srcPort,
-                                seq = session.serverSeq,
-                                ack = session.clientSeq,
-                                flags = 0x10, // ACK
-                                payload = null,
-                                outputStream = out
-                            )
-                        }
-                    } catch (e: Exception) {
+                try {
+                    val tunnel = session.remoteTunnel
+                    if (tunnel != null) {
+                        tunnel.send(payloadBytes, payloadLen)
+                        
+                        session.clientSeq = seq + payloadLen
+                        sendTcpPacket(
+                            srcIp = session.destIp,
+                            dstIp = session.clientIp,
+                            srcPort = session.destPort,
+                            dstPort = session.srcPort,
+                            seq = session.serverSeq,
+                            ack = session.clientSeq,
+                            flags = 0x10, // ACK
+                            payload = null,
+                            outputStream = out
+                        )
                     }
-                }.start()
+                } catch (e: Exception) {
+                    Log.e("MyVpnService", "Error sending TCP payload to tunnel", e)
+                }
             }
         }
     }
@@ -1065,10 +1343,28 @@ class MyVpnService : VpnService(), Runnable {
             }
         }
         
+        val targetAddr = try {
+            val isIpv4 = config.address.matches(Regex("""^(\d{1,3}\.){3}\d{1,3}$"""))
+            val isIpv6 = config.address.contains(":") && !config.address.contains("[a-zA-Z]".toRegex())
+            if (isIpv4 || isIpv6) {
+                config.address
+            } else {
+                val resolved = resolveDomainViaTcpDns(config.address)
+                if (resolved != null) {
+                    resolved
+                } else {
+                    Log.w("MyVpnService", "Could not resolve server domain via TCP DNS, falling back to system resolver")
+                    config.address
+                }
+            }
+        } catch (e: Exception) {
+            config.address
+        }
+        
         return try {
             val socket = Socket()
             protect(socket)
-            socket.connect(InetSocketAddress(config.address, config.port), 12000)
+            socket.connect(InetSocketAddress(targetAddr, config.port), 12000)
             
             val activeSocket = if (config.security == "tls" || config.security == "xtls" || config.port == 443) {
                 val sslSocketFactory = getTrustAllSocketFactory()
@@ -1122,15 +1418,8 @@ class MyVpnService : VpnService(), Runnable {
                 VlessTcpTlsTunnel(activeSocket, config, destHost, destPort)
             }
         } catch (e: Exception) {
-            Log.e("MyVpnService", "VLESS connection failed, falling back to direct connection for $destHost:$destPort", e)
-            try {
-                val socket = Socket()
-                protect(socket)
-                socket.connect(InetSocketAddress(destHost, destPort), 10000)
-                DirectTcpTunnel(socket)
-            } catch (ex: Exception) {
-                null
-            }
+            Log.e("MyVpnService", "VLESS connection failed to $destHost:$destPort", e)
+            null
         }
     }
 
@@ -1217,10 +1506,37 @@ class MyVpnService : VpnService(), Runnable {
             vlessHeader.write(0x01) // Command CONNECT
             vlessHeader.write((destPort shr 8) and 0xFF)
             vlessHeader.write(destPort and 0xFF)
-            vlessHeader.write(0x02) // Address type Domain
-            val domainBytes = destHost.toByteArray(Charsets.UTF_8)
-            vlessHeader.write(domainBytes.size)
-            vlessHeader.write(domainBytes)
+            val isIpv4 = destHost.matches(Regex("""^(\d{1,3}\.){3}\d{1,3}$"""))
+            val isIpv6 = destHost.contains(":") && !destHost.contains("[a-zA-Z]".toRegex())
+            
+            if (isIpv4) {
+                vlessHeader.write(0x01) // Address type IPv4
+                val ipBytes = destHost.split(".").map { it.toInt().toByte() }.toByteArray()
+                vlessHeader.write(ipBytes)
+            } else if (isIpv6) {
+                vlessHeader.write(0x03) // Address type IPv6
+                try {
+                    val addrBytes = java.net.InetAddress.getByName(destHost).address
+                    if (addrBytes.size == 16) {
+                        vlessHeader.write(addrBytes)
+                    } else {
+                        vlessHeader.write(0x02)
+                        val domainBytes = destHost.toByteArray(Charsets.UTF_8)
+                        vlessHeader.write(domainBytes.size)
+                        vlessHeader.write(domainBytes)
+                    }
+                } catch (e: Exception) {
+                    vlessHeader.write(0x02)
+                    val domainBytes = destHost.toByteArray(Charsets.UTF_8)
+                    vlessHeader.write(domainBytes.size)
+                    vlessHeader.write(domainBytes)
+                }
+            } else {
+                vlessHeader.write(0x02) // Address type Domain
+                val domainBytes = destHost.toByteArray(Charsets.UTF_8)
+                vlessHeader.write(domainBytes.size)
+                vlessHeader.write(domainBytes)
+            }
             
             writeWsFrame(output, vlessHeader.toByteArray(), 0, vlessHeader.size())
         }
@@ -1270,10 +1586,37 @@ class MyVpnService : VpnService(), Runnable {
             vlessHeader.write(0x01) // Command CONNECT
             vlessHeader.write((destPort shr 8) and 0xFF)
             vlessHeader.write(destPort and 0xFF)
-            vlessHeader.write(0x02) // Address type Domain
-            val domainBytes = destHost.toByteArray(Charsets.UTF_8)
-            vlessHeader.write(domainBytes.size)
-            vlessHeader.write(domainBytes)
+            val isIpv4 = destHost.matches(Regex("""^(\d{1,3}\.){3}\d{1,3}$"""))
+            val isIpv6 = destHost.contains(":") && !destHost.contains("[a-zA-Z]".toRegex())
+            
+            if (isIpv4) {
+                vlessHeader.write(0x01) // Address type IPv4
+                val ipBytes = destHost.split(".").map { it.toInt().toByte() }.toByteArray()
+                vlessHeader.write(ipBytes)
+            } else if (isIpv6) {
+                vlessHeader.write(0x03) // Address type IPv6
+                try {
+                    val addrBytes = java.net.InetAddress.getByName(destHost).address
+                    if (addrBytes.size == 16) {
+                        vlessHeader.write(addrBytes)
+                    } else {
+                        vlessHeader.write(0x02)
+                        val domainBytes = destHost.toByteArray(Charsets.UTF_8)
+                        vlessHeader.write(domainBytes.size)
+                        vlessHeader.write(domainBytes)
+                    }
+                } catch (e: Exception) {
+                    vlessHeader.write(0x02)
+                    val domainBytes = destHost.toByteArray(Charsets.UTF_8)
+                    vlessHeader.write(domainBytes.size)
+                    vlessHeader.write(domainBytes)
+                }
+            } else {
+                vlessHeader.write(0x02) // Address type Domain
+                val domainBytes = destHost.toByteArray(Charsets.UTF_8)
+                vlessHeader.write(domainBytes.size)
+                vlessHeader.write(domainBytes)
+            }
             
             val headerBytes = vlessHeader.toByteArray()
             output.write(headerBytes)
@@ -1313,6 +1656,126 @@ class MyVpnService : VpnService(), Runnable {
         }
     }
 
+    private fun resolveDomainViaTcpDns(domain: String): String? {
+        val dnsServers = listOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222")
+        val dnsPayload = buildDnsQueryBytes(domain) ?: return null
+        
+        // 1. Try DNS over HTTPS first (absolutely censorship resistant, runs on port 443)
+        for (serverIp in dnsServers) {
+            try {
+                val resp = resolveDnsOverHttps(dnsPayload, serverIp)
+                if (resp != null && resp.size > 12) {
+                    val resolvedIp = extractDnsResponseFirstIp(resp)
+                    if (!resolvedIp.isNullOrEmpty()) {
+                        Log.d("MyVpnService", "Resolved server domain $domain via DNS-over-HTTPS as $resolvedIp")
+                        return resolvedIp
+                    }
+                }
+            } catch (e: Exception) {
+                // Try next
+            }
+        }
+        
+        // 2. Fallback to TCP DNS
+        for (serverIp in dnsServers) {
+            try {
+                val resp = resolveDnsOverTcp(dnsPayload, serverIp)
+                if (resp != null && resp.size > 12) {
+                    val resolvedIp = extractDnsResponseFirstIp(resp)
+                    if (!resolvedIp.isNullOrEmpty()) {
+                        Log.d("MyVpnService", "Resolved server domain $domain via DNS-over-TCP as $resolvedIp")
+                        return resolvedIp
+                    }
+                }
+            } catch (e: Exception) {
+                // Try next
+            }
+        }
+        return null
+    }
+
+    private fun buildDnsQueryBytes(domain: String): ByteArray? {
+        try {
+            val out = java.io.ByteArrayOutputStream()
+            // Tx ID
+            out.write(0x12)
+            out.write(0x34)
+            // Flags: standard query, recursion desired
+            out.write(0x01)
+            out.write(0x00)
+            // Questions count: 1
+            out.write(0x00)
+            out.write(0x01)
+            // Answer, Authority, Additional counts: 0
+            out.write(0x00)
+            out.write(0x00)
+            out.write(0x00)
+            out.write(0x00)
+            out.write(0x00)
+            out.write(0x00)
+            
+            // Domain sections
+            val labels = domain.split(".")
+            for (label in labels) {
+                val bytes = label.toByteArray(Charsets.US_ASCII)
+                if (bytes.size > 63) return null
+                out.write(bytes.size)
+                out.write(bytes)
+            }
+            out.write(0x00) // Null terminator
+            
+            // Type A (1), Class IN (1)
+            out.write(0x00)
+            out.write(0x01)
+            out.write(0x00)
+            out.write(0x01)
+            
+            return out.toByteArray()
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
+    private fun extractDnsResponseFirstIp(responseBytes: ByteArray): String? {
+        try {
+            if (responseBytes.size < 12) return null
+            val qdCount = ((responseBytes[4].toInt() and 0xFF) shl 8) or (responseBytes[5].toInt() and 0xFF)
+            val anCount = ((responseBytes[6].toInt() and 0xFF) shl 8) or (responseBytes[7].toInt() and 0xFF)
+            
+            var pos = 12
+            // Skip Questions section
+            for (i in 0 until qdCount) {
+                pos = skipDnsName(responseBytes, pos)
+                pos += 4 // Type (2 bytes) + Class (2 bytes)
+            }
+            
+            // Parse Answers section
+            for (i in 0 until anCount) {
+                if (pos >= responseBytes.size) break
+                pos = skipDnsName(responseBytes, pos)
+                if (pos + 10 > responseBytes.size) break
+                
+                val type = ((responseBytes[pos].toInt() and 0xFF) shl 8) or (responseBytes[pos + 1].toInt() and 0xFF)
+                val rdLength = ((responseBytes[pos + 8].toInt() and 0xFF) shl 8) or (responseBytes[pos + 9].toInt() and 0xFF)
+                pos += 10
+                
+                if (pos + rdLength > responseBytes.size) break
+                
+                if (type == 1 && rdLength == 4) { // IPv4 A record
+                    val ip0 = responseBytes[pos].toInt() and 0xFF
+                    val ip1 = responseBytes[pos + 1].toInt() and 0xFF
+                    val ip2 = responseBytes[pos + 2].toInt() and 0xFF
+                    val ip3 = responseBytes[pos + 3].toInt() and 0xFF
+                    return "$ip0.$ip1.$ip2.$ip3"
+                }
+                pos += rdLength
+            }
+        } catch (e: Exception) {
+            // ignore
+        }
+        return null
+    }
+
     enum class ConnectionState {
         DISCONNECTED,
         CONNECTING,
@@ -1350,7 +1813,14 @@ class MyVpnService : VpnService(), Runnable {
                 output.write((len shr 8) and 0xFF)
                 output.write(len and 0xFF)
             } else {
-                output.write(126 or 0x80)
+                output.write(127 or 0x80)
+                // Write 8-byte length (0, 0, 0, 0, then 4 bytes of Int length)
+                output.write(0)
+                output.write(0)
+                output.write(0)
+                output.write(0)
+                output.write((len shr 24) and 0xFF)
+                output.write((len shr 16) and 0xFF)
                 output.write((len shr 8) and 0xFF)
                 output.write(len and 0xFF)
             }

@@ -1,5 +1,5 @@
 {
-  "name": "Mrvpn",
+  "name": "MrVpn",
   "description": "یک اپلیکیشن فیلترشکن زیبا و امن با همگام‌سازی خودکار ساب‌اسکریپشن، تست پینگ هوشمند، نمایش لحظه‌ای سرعت و پشتیبانی از پروتکل‌های مختلف",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

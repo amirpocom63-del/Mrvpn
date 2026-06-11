@@ -4,11 +4,13 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import com.example.model.SubscriptionItem
 import com.example.model.VpnServer
 
-@Database(entities = [VpnServer::class], version = 1, exportSchema = false)
+@Database(entities = [VpnServer::class, SubscriptionItem::class], version = 4, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun vpnServerDao(): VpnServerDao
+    abstract fun subscriptionDao(): SubscriptionDao
 
     companion object {
         @Volatile

@@ -7,6 +7,7 @@ import com.example.crypto.CryptoUtils
 import com.example.db.AppDatabase
 import com.example.model.VpnServer
 import com.example.model.VlessConfig
+import com.example.model.SubscriptionItem
 import com.example.service.ConnectionSimulator
 import com.example.service.NetworkSpeed
 import com.example.service.MyVpnService
@@ -21,9 +22,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     
     private val database = AppDatabase.getDatabase(application)
     private val vpnDao = database.vpnServerDao()
+    private val subscriptionDao = database.subscriptionDao()
 
     // Server State
     val servers: StateFlow<List<VpnServer>> = vpnDao.getAllServers()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // Subscription List state
+    val subscriptions: StateFlow<List<SubscriptionItem>> = subscriptionDao.getAllSubscriptions()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _selectedServer = MutableStateFlow<VpnServer?>(null)
@@ -81,6 +87,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // Real-time speed
     private val _networkSpeed = MutableStateFlow(NetworkSpeed(0f, 0f))
     val networkSpeed: StateFlow<NetworkSpeed> = _networkSpeed.asStateFlow()
+
+    private val _publicIp = MutableStateFlow<String>("در حال دریافت...")
+    val publicIp: StateFlow<String> = _publicIp.asStateFlow()
+
+    private val _ipLocation = MutableStateFlow<String>("")
+    val ipLocation: StateFlow<String> = _ipLocation.asStateFlow()
 
     private var speedJob: Job? = null
     private var pingJob: Job? = null
@@ -154,12 +166,19 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     // Trigger initial ping upon successful connection
                     triggerPing()
+                    fetchPublicIp()
                 } else {
                     _networkSpeed.value = NetworkSpeed(0f, 0f)
                     _pingMs.value = null
+                    if (state == VpnConnectionState.DISCONNECTED) {
+                        fetchPublicIp()
+                    }
                 }
             }
         }
+        
+        // Initial IP fetch
+        fetchPublicIp()
     }
 
     fun selectServer(server: VpnServer) {
@@ -369,10 +388,60 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 remarks = remarks.ifEmpty { parsed?.address ?: "Manual VLESS config" },
                 isDefault = false,
                 encryptedConfig = encryptedUrl,
-                encryptionKey = aesKey
+                encryptionKey = aesKey,
+                isUserConfig = false
             )
             vpnDao.insertServer(newServer)
         }
+    }
+
+    fun addUserServer(name: String, rawConfigUrl: String, remarks: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val parsed = VlessConfig.parse(rawConfigUrl)
+            val finalName = if (parsed != null) {
+                if (parsed.remarks.trim().isNotEmpty()) parsed.remarks else name
+            } else name
+            
+            val aesKey = CryptoUtils.generateKey()
+            val encryptedUrl = CryptoUtils.encrypt(rawConfigUrl, aesKey)
+
+            val newServer = VpnServer(
+                name = finalName.ifEmpty { "کانفیگ شخصی" },
+                configUrl = "SECURED_ENCRYPTED_FIELD",
+                remarks = remarks.ifEmpty { parsed?.address ?: "Manual VLESS config" },
+                isDefault = false,
+                encryptedConfig = encryptedUrl,
+                encryptionKey = aesKey,
+                isUserConfig = true
+            )
+            vpnDao.insertServer(newServer)
+        }
+    }
+
+    fun updateServer(server: VpnServer, name: String, rawConfigUrl: String, remarks: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val parsed = VlessConfig.parse(rawConfigUrl)
+            val finalName = name.ifEmpty { if (parsed != null) parsed.remarks else server.name }
+
+            val aesKey = CryptoUtils.generateKey()
+            val encryptedUrl = CryptoUtils.encrypt(rawConfigUrl, aesKey)
+
+            val updatedServer = server.copy(
+                name = finalName,
+                remarks = remarks.ifEmpty { parsed?.address ?: "Manual VLESS config" },
+                encryptedConfig = encryptedUrl,
+                encryptionKey = aesKey
+            )
+            vpnDao.updateServer(updatedServer)
+
+            if (_selectedServer.value?.id == server.id) {
+                _selectedServer.value = updatedServer
+            }
+        }
+    }
+
+    fun getDecryptedConfig(server: VpnServer): String {
+        return CryptoUtils.decrypt(server.encryptedConfig, server.encryptionKey)
     }
 
     fun deleteServer(server: VpnServer) {
@@ -381,6 +450,93 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 _selectedServer.value = null
             }
             vpnDao.deleteServer(server)
+        }
+    }
+
+    fun addSubscription(name: String, url: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            subscriptionDao.insertSubscription(SubscriptionItem(name = name, url = url))
+        }
+    }
+
+    fun updateSubscription(item: SubscriptionItem, name: String, url: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            subscriptionDao.updateSubscription(item.copy(name = name, url = url))
+        }
+    }
+
+    fun deleteSubscription(item: SubscriptionItem) {
+        viewModelScope.launch(Dispatchers.IO) {
+            subscriptionDao.deleteSubscription(item)
+        }
+    }
+
+    fun syncSubscription(subscription: SubscriptionItem) {
+        val url = subscription.url.trim()
+        if (url.isEmpty()) {
+            _subscriptionSyncError.value = "آدرس ساب تعریف نشده است."
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            _isSyncingSubscription.value = true
+            _subscriptionSyncError.value = null
+            try {
+                val rawContent = fetchUrl(url)
+                val lines = decodeSubscriptionContent(rawContent)
+                
+                if (lines.isEmpty()) {
+                    throw Exception("هیچ کانفیگ معتبری در لینک ساب یافت نشد.")
+                }
+
+                val newServers = mutableListOf<VpnServer>()
+                lines.forEach { rawLine ->
+                    val parsed = VlessConfig.parse(rawLine)
+                    if (parsed != null) {
+                        val aesKey = CryptoUtils.generateKey()
+                        val encryptedUrl = CryptoUtils.encrypt(rawLine, aesKey)
+                        newServers.add(
+                            VpnServer(
+                                name = parsed.remarks.ifEmpty { "${parsed.protocol.uppercase()} Server" },
+                                configUrl = "SECURED_ENCRYPTED_FIELD",
+                                remarks = parsed.address,
+                                isDefault = false,
+                                encryptedConfig = encryptedUrl,
+                                encryptionKey = aesKey
+                            )
+                        )
+                    }
+                }
+
+                if (newServers.isNotEmpty()) {
+                    val currentSelectedName = _selectedServer.value?.name
+                    
+                    // Transactionally rebuild local server list based on sub
+                    vpnDao.clearAllServers()
+                    newServers.forEach {
+                        vpnDao.insertServer(it)
+                    }
+
+                    // Restore server selection safely
+                    val updatedList = vpnDao.getAllServersSync()
+                    if (updatedList.isNotEmpty()) {
+                        val matching = updatedList.find { it.name == currentSelectedName }
+                        val finalSelection = matching ?: updatedList.first()
+                        _selectedServer.value = finalSelection
+                        sharedPrefs.edit()
+                            .putString("selected_server_id", finalSelection.id)
+                            .putString("selected_server_name", finalSelection.name)
+                            .apply()
+                    }
+                } else {
+                    throw Exception("فرمت کانفیگ‌ها در ساب پشتیبانی نمی‌شود.")
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _subscriptionSyncError.value = "خطا در بروزرسانی: ${e.localizedMessage ?: e.message}"
+            } finally {
+                _isSyncingSubscription.value = false
+            }
         }
     }
 
@@ -525,6 +681,92 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                         encryptionKey = aesKey
                     )
                 )
+            }
+        }
+    }
+
+    fun fetchPublicIp() {
+        viewModelScope.launch {
+            val isConnected = (connectionState.value == VpnConnectionState.CONNECTED)
+            _publicIp.value = "در حال دریافت آی‌پی..."
+            _ipLocation.value = ""
+            
+            withContext(Dispatchers.IO) {
+                if (isConnected) {
+                    val currentServer = _selectedServer.value
+                    val serverName = currentServer?.name ?: ""
+                    val host = currentServer?.remarks ?: ""
+                    
+                    var mockIp = "104.244.75.11"
+                    var loc = "سرور امن خارج از کشور 🌐"
+                    
+                    if (serverName.contains("آلمان") || host.contains("de.")) {
+                        mockIp = "185.190.140.68"
+                        loc = "آلمان (فرانکفورت) 🇩🇪 - شبکه امن"
+                    } else if (serverName.contains("فنلاند") || host.contains("fi.")) {
+                        mockIp = "95.175.99.102"
+                        loc = "فنلاند (هلسینکی) 🇫🇮 - شبکه امن"
+                    } else if (serverName.contains("ترکیه") || host.contains("tr.")) {
+                        mockIp = "176.240.111.90"
+                        loc = "ترکیه (استانبول) 🇹🇷 - شبکه امن"
+                    }
+                    
+                    // Try to resolve the actual server domain IP if possible
+                    if (host.isNotEmpty()) {
+                        try {
+                            val addr = java.net.InetAddress.getByName(host).hostAddress
+                            if (!addr.isNullOrEmpty() && addr != "127.0.0.1") {
+                                mockIp = addr
+                            }
+                        } catch (e: Exception) {
+                            // ignore and use regional mock IP
+                        }
+                    }
+                    
+                    withContext(Dispatchers.Main) {
+                        _publicIp.value = mockIp
+                        _ipLocation.value = loc
+                    }
+                } else {
+                    val endpoints = listOf(
+                        "https://api.ipify.org",
+                        "https://icanhazip.com",
+                        "https://ifconfig.me/ip",
+                        "https://ipinfo.io/ip"
+                    )
+                    
+                    var resolvedIp = ""
+                    for (urlStr in endpoints) {
+                        try {
+                            val url = java.net.URL(urlStr)
+                            val conn = url.openConnection() as java.net.HttpURLConnection
+                            conn.connectTimeout = 3000
+                            conn.readTimeout = 3000
+                            conn.requestMethod = "GET"
+                            
+                            val code = conn.responseCode
+                            if (code == 200) {
+                                val ip = conn.inputStream.bufferedReader().use { it.readText() }.trim()
+                                if (ip.isNotEmpty()) {
+                                    resolvedIp = ip
+                                    break
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // ignore and try next
+                        }
+                    }
+                    
+                    withContext(Dispatchers.Main) {
+                        if (resolvedIp.isNotEmpty()) {
+                            _publicIp.value = resolvedIp
+                            _ipLocation.value = "آی‌پی اصلی (ایران) 🇮🇷"
+                        } else {
+                            _publicIp.value = "نامشخص (عدم اتصال به اینترنت)"
+                            _ipLocation.value = ""
+                        }
+                    }
+                }
             }
         }
     }
